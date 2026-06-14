@@ -1,90 +1,4 @@
-"""
-pippo_server_4.py  --  Runs on the LAPTOP (SERVER)
-===================================================
-Fixes vs previous version:
-  . BT_FIXED_MUTE_SECS = 10 : hard flat mute after every robot utterance.
-    Replaces the fragile estimated-playback calculation.  The mic will not
-    open until exactly 10 s after the audio packet was sent to the robot,
-    giving the BT speaker plenty of time to finish and go silent.
-  . APPROVAL_TIMEOUT raised 12 -> 20 s  (user has a full 10 s listen window
-    + a few seconds to think before the timeout fires).
-  . COOLDOWN_AFTER raised 20 -> 35 s so the personality engine does NOT
-    immediately re-trigger another question the moment the mic opens.
-  . _MIC_LOCK: global lock prevents EmotionSensor stealing the mic while
-    VoiceListener is recording.
-  . EmotionSensor audio loop uses non-blocking acquire + 3 s sleep so it
-    never queues behind the voice listener.
-  . "You can speak now" beep + green video overlay on mic-open transition.
-  . Video overlay now shows MIC MUTED countdown so you can see when it opens.
-
-Patch notes (v4 -> v4.1):
-  . FIX 1: handle_approval() now strips punctuation with re.sub before
-    splitting into words -- fixes "Yes," not matching "yes".
-  . FIX 2: TTSSpeaker.clear_queue() added; called before every important
-    new utterance so voices no longer overlap.
-  . FIX 3: PersonalityEngine.update() guards on self._tts.is_muted() so
-    the emotion loop cannot re-trigger a new approval question while the
-    robot is still speaking / mic is muted.
-  . FIX 4: _ask_permission() calls clear_queue() synchronously so no
-    stale speech plays over the new permission question.
-
-Patch notes (v4.1 -> v4.2):
-  . FIX 5: Dynamic BT mute window.
-    - BT_FIXED_MUTE_SECS (10 s) used for short utterances: permission
-      questions, chat starters, touch responses.
-    - BT_LONG_MUTE_SECS  (30 s) used for behavior responses (jokes,
-      comfort messages, hype lines) which are longer and need more time.
-    - TTSSpeaker.say() accepts an optional mute_override kwarg so any
-      caller can specify an exact mute duration.
-  . FIX 6: "Unclear" approval now sets cooldown_until so the emotion loop
-    cannot immediately re-fire a new _ask_permission before the chat
-    reply has even been queued.
-  . FIX 7: Generation counter (_approval_gen) on approval timeouts.
-    When a new approval cycle starts or the old one resolves, stale
-    timeout threads detect the generation mismatch and exit silently,
-    preventing them from firing over a subsequent permission question.
-
-Patch notes (v4.2 -> v4.3):
-  . FIX 8: Race condition between VoiceListener chat and PersonalityEngine
-    emotion loop.
-    - VoiceListener._processing_chat flag added; set True while Ollama is
-      generating a reply.
-    - PersonalityEngine.update() returns early if _processing_chat is True,
-      so the emotion loop cannot sneak in a new approval question while
-      Ollama is still thinking (TTS has not started yet, mute window is
-      not active yet).
-    - Chat reply is also discarded if an approval question arrived during
-      Ollama generation (is_awaiting_approval() guard before say()).
-    - PersonalityEngine.set_voice_listener() wires the back-reference.
-
-Patch notes (v4.3 -> v4.4):
-  . FIX 9: Expanded _YES_WORDS to catch natural affirmative phrases like
-    "I would love to", "love to hear", "that would be great", "sounds good",
-    "why not", "go for it", "tell me more", "let's do it", "I'd like that".
-    Fixes "I would love to hear something funny" being routed to Unclear
-    instead of Approved.
-  . FIX 10: Chat replies now use BT_LONG_MUTE_SECS (30 s) instead of the
-    default 10 s mute.  Ollama chat responses are often 2-3 sentences and
-    take 15-25 s to play over BT; the 10 s window caused the mic to reopen
-    mid-speech, Whisper to hallucinate, and the emotion loop to immediately
-    fire a new approval question.
-  . FIX 11: VoiceListener._loop() sets cooldown after every chat reply so
-    the emotion loop cannot re-trigger an approval question for COOLDOWN_AFTER
-    seconds after the robot finishes speaking.  Previously cooldown was only
-    set on approval deny/timeout, not on normal chat.
-
-Tuning BT_FIXED_MUTE_SECS / BT_LONG_MUTE_SECS:
-  Too short -> mic catches end of robot speech -> Whisper hallucinates.
-  Too long  -> conversation feels slow.
-  Defaults: 10 s short / 30 s long.  CLI overrides:
-    python pippo_server_4.py --mute 8 --mute-long 25
-
-Flow:
-    1.  python pippo_server_4.py          (laptop -- FIRST)
-    2.  python pippo_robot.py 10.42.0.1   (Pi -- SECOND)
-"""
 from __future__ import annotations
-
 import argparse
 import base64
 import os
@@ -99,82 +13,41 @@ import tempfile
 import threading
 import time
 import math
-
 import cv2
 import numpy as np
 
-
-
-# =============================================================================
-#  CONFIGURATION
-# =============================================================================
-
-OLLAMA_HOST  = "http://localhost:11434"
+OLLAMA_HOST = "http://localhost:11434"
 OLLAMA_MODEL = "phi3:mini"
-
-# --- Audio output mode -------------------------------------------------------
-AUDIO_OUTPUT  = "bluetooth"   # "bluetooth" or "aux"
-
-# AUX settings (ignored in bluetooth mode)
-AUX_VOLUME      = 1.0
+AUDIO_OUTPUT = "bluetooth"
+AUX_VOLUME = 1.0
 AUX_SPEECH_RATE = 145
-
-# --- Mute windows ------------------------------------------------------------
-# FIX 5: two separate BT mute durations.
-#
-# BT_FIXED_MUTE_SECS  -- short utterances:
-#     permission questions ("Want to hear a joke?")
-#     chat starters       ("What's on your mind?")
-#     touch responses     ("Hey that tickles!")
-#
-# BT_LONG_MUTE_SECS   -- behavior responses:
-#     jokes / comfort lines / hype messages (these can run 10-20 s of
-#     speech on BT + speaker settling time, so 30 s is a safe window)
-BT_FIXED_MUTE_SECS = 10.0   # seconds -- short utterances
-BT_LONG_MUTE_SECS  = 30.0   # seconds -- behavior / LLM responses
-
-# AUX: estimated playback + pad (no BT lag)
-AUX_POST_PAD = 2.0           # seconds added to estimated playback for AUX
-
-# --- Speak-now cue -----------------------------------------------------------
+BT_FIXED_MUTE_SECS = 10.0
+BT_LONG_MUTE_SECS = 30.0
+AUX_POST_PAD = 2.0
 SPEAK_NOW_CUE_ENABLED = True
-SPEAK_NOW_CUE_FREQ    = 880    # Hz
-SPEAK_NOW_CUE_SECS    = 0.20
-
-# --- Whisper / mic -----------------------------------------------------------
-WHISPER_SILENCE_RMS = 7     # RMS*1000 threshold -- below = silence, skip
-WHISPER_CHUNK_SEC   = 5       # seconds recorded per listen pass
-WHISPER_MIN_WORDS   = 2       # discard transcription shorter than this
+SPEAK_NOW_CUE_FREQ = 880    
+SPEAK_NOW_CUE_SECS = 0.20
+WHISPER_SILENCE_RMS = 7 
+WHISPER_CHUNK_SEC = 5     
+WHISPER_MIN_WORDS = 2      
 WHISPER_MODEL_SIZE  = "base"
-MIC_DEVICE_INDEX    = 1       # [1] Microphone Array (Realtek) -- confirmed
-
-# --- Timing ------------------------------------------------------------------
-SENSE_INTERVAL    = 20   # seconds between emotion analyses
-AUDIO_DURATION    = 3    # seconds of mic per emotion audio sample
-BEHAVIOR_DURATION = 25   # seconds a personality mode stays active
-COOLDOWN_AFTER    = 35   # seconds cooldown after any personality trigger
-                          # MUST be > BT_FIXED_MUTE_SECS so a new question
-                          # is never asked before the mic has even opened once
-APPROVAL_TIMEOUT  = 20   # seconds to wait for yes/no (was 12)
-
-# --- Hand following ----------------------------------------------------------
-CMD_PORT           = 5003
-VIDEO_PORT         = 8003
-BASE_SPEED_NORMAL  = 1600
-BASE_SPEED_CLOSE   = -700
-BASE_SPEED_FAR     = 1300
-AREA_TOO_CLOSE     = 0.18
-AREA_TOO_FAR       = 0.03
-DEAD_ZONE          = 0.07
-NO_HAND_TIMEOUT    = 2.0
-
-# =============================================================================
-#  LIBRARY IMPORTS
-# =============================================================================
-
+MIC_DEVICE_INDEX = 1      
+SENSE_INTERVAL= 20  
+AUDIO_DURATION = 3    
+BEHAVIOR_DURATION = 25   
+COOLDOWN_AFTER = 35   
+APPROVAL_TIMEOUT = 20  
+CMD_PORT = 5003
+VIDEO_PORT = 8003
+BASE_SPEED_NORMAL = 1600
+BASE_SPEED_CLOSE = -700
+BASE_SPEED_FAR = 1300
+AREA_TOO_CLOSE = 0.18
+AREA_TOO_FAR = 0.03
+DEAD_ZONE = 0.07
+NO_HAND_TIMEOUT = 2.0
 print("[BOOT] Loading libraries ...")
 
-# MediaPipe
 try:
     import mediapipe as mp
     from mediapipe.tasks import python as _mp_python
@@ -198,7 +71,7 @@ except Exception as _e:
     MEDIAPIPE_OK = False
     print(f"[WARN] mediapipe unavailable ({_e}) -- hand following disabled")
 
-# DeepFace
+
 try:
     os.environ['DEEPFACE_HOME'] = r'C:\Users\Bala Ganesh\Downloads\Final robot\Freenove_Tank_Robot_Kit_for_Raspberry_Pi\.deepface'
     from deepface import DeepFace as _DeepFace
@@ -214,7 +87,7 @@ except Exception as _e:
     DEEPFACE_OK = False
     print(f"[WARN] deepface unavailable ({_e})")
 
-# VADER
+
 try:
     from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer as _VADER
     _vader = _VADER()
@@ -225,7 +98,6 @@ except Exception as _e:
     VADER_OK = False
     print(f"[WARN] vaderSentiment unavailable ({_e})")
 
-# librosa
 try:
     import librosa as _librosa
     LIBROSA_OK = True
@@ -235,7 +107,7 @@ except Exception as _e:
     LIBROSA_OK = False
     print(f"[WARN] librosa unavailable ({_e})")
 
-# sounddevice
+
 try:
     import sounddevice as _sd
     SD_OK = True
@@ -251,7 +123,7 @@ except Exception as _e:
     SD_OK = False
     print(f"[WARN] sounddevice unavailable ({_e})")
 
-# openai-whisper
+
 try:
     import whisper as _openai_whisper
     print(f"[BOOT] Loading openai-whisper model ({WHISPER_MODEL_SIZE}) from cache ...")
@@ -263,7 +135,7 @@ except Exception as _e:
     WHISPER_OK = False
     print(f"[WARN] openai-whisper unavailable ({_e}) -- always-listening disabled")
 
-# pyttsx3
+
 try:
     import pyttsx3 as _pyttsx3
     _tts_engine = _pyttsx3.init()
@@ -282,15 +154,7 @@ import urllib.request
 import json as _json
 print(f"[OK]   ollama (via urllib)   audio_output={AUDIO_OUTPUT}")
 print("[BOOT] Done.\n")
-
-# =============================================================================
-#  GLOBAL MIC LOCK  -- only one thread records at a time
-# =============================================================================
 _MIC_LOCK = threading.Lock()
-
-# =============================================================================
-#  SPEAK-NOW CUE
-# =============================================================================
 
 def _play_speak_now_cue():
     if not SPEAK_NOW_CUE_ENABLED or not SD_OK:
@@ -305,10 +169,6 @@ def _play_speak_now_cue():
         _sd.wait()
     except Exception:
         pass
-
-# =============================================================================
-#  HAND DETECTOR
-# =============================================================================
 
 class HandDetector:
     def detect(self, frame: np.ndarray):
@@ -337,10 +197,6 @@ class HandDetector:
                 _mp_hand_landmarker.close()
             except Exception:
                 pass
-
-# =============================================================================
-#  EMOTION SENSOR
-# =============================================================================
 
 class EmotionSensor:
     def __init__(self):
@@ -399,10 +255,6 @@ class EmotionSensor:
             time.sleep(SENSE_INTERVAL)
 
     def _audio_loop(self):
-        """
-        Measure ambient energy for emotion fusion.
-        Non-blocking mic acquire -- skips sample if VoiceListener is recording.
-        """
         if not SD_OK:
             return
         sample_rate = 16000
@@ -443,10 +295,6 @@ class EmotionSensor:
         if compound > 0.35 and face_emotion == 'neutral':
             return 'happy'
         return face_emotion
-
-# =============================================================================
-#  OLLAMA RESPONDER
-# =============================================================================
 
 _PROMPTS = {
     'comforter': (
@@ -573,31 +421,11 @@ class OllamaResponder:
             print(f"[WARN] Ollama chat call failed ({_e})")
         return "Sorry, my brain glitched for a second. Can you say that again?"
 
-# =============================================================================
-#  TTS SPEAKER
-# =============================================================================
-
 class TTSSpeaker:
-    """
-    Mute window:
-      Bluetooth mode -> caller-specified mute (mute_override) or one of the
-                        two defaults:
-                          BT_FIXED_MUTE_SECS (10 s) for short utterances
-                          BT_LONG_MUTE_SECS  (30 s) for behavior responses
-      AUX mode       -> estimated playback + AUX_POST_PAD.
-
-    FIX 5: say() accepts an optional mute_override kwarg.  The internal
-    queue stores (text, mute_override) tuples so each item carries its
-    own mute duration.
-
-    FIX 2: clear_queue() drains pending speech so new high-priority
-    utterances are not delayed or buried behind stale queued text.
-    """
 
     def __init__(self, enabled: bool, cmd_sender=None):
         self._enabled    = enabled
         self._cmd_sender = cmd_sender
-        # FIX 5: queue items are (text, mute_override | None) tuples
         self._q          = queue.Queue()
         self._speaking   = False
         self._mute_until = 0.0
@@ -614,11 +442,7 @@ class TTSSpeaker:
     def is_speaking(self) -> bool:
         return self.is_muted()
 
-    # ------------------------------------------------------------------
-    # FIX 2: drain the pending-speech queue before queuing new text
-    # ------------------------------------------------------------------
     def clear_queue(self):
-        """Discard any speech waiting in the queue (does not stop current utterance)."""
         drained = 0
         while not self._q.empty():
             try:
@@ -629,23 +453,17 @@ class TTSSpeaker:
         if drained:
             print(f"[TTS]  clear_queue() dropped {drained} pending item(s)")
 
-    # ------------------------------------------------------------------
-    # FIX 5: optional mute_override -- pass BT_LONG_MUTE_SECS for long
-    # behavior responses; leave as None for the default short window.
-    # ------------------------------------------------------------------
     def say(self, text: str, mute_override: float | None = None):
         print(f"[TTS]  \"{text}\"")
         if self._enabled:
             self._q.put((text, mute_override))
 
     def _mute_secs_for_wav(self, wav_bytes: int) -> float:
-        """AUX only: estimate playback duration + pad."""
         playback = wav_bytes / 44100   # 22050 Hz 16-bit mono
         return playback + AUX_POST_PAD
 
     def _run(self):
         while True:
-            # FIX 5: unpack tuple
             text, mute_override = self._q.get()
             self._speaking = True
             try:
@@ -675,7 +493,6 @@ class TTSSpeaker:
 
                                 self._cmd_sender.send(f"CMD_AUDIO#{audio_b64}")
 
-                                # ---- MUTE WINDOW (FIX 5) ----
                                 if AUDIO_OUTPUT == "bluetooth":
                                     if mute_override is not None:
                                         mute_secs = mute_override
@@ -696,7 +513,6 @@ class TTSSpeaker:
                         except Exception as _e:
                             print(f"[TTS]  Audio generation error: {_e}")
 
-                # Fallback: speak on laptop
                 if TTS_OK and _tts_engine is not None:
                     try:
                         print("[TTS]  (fallback -- speaking on laptop)")
@@ -714,7 +530,6 @@ class TTSSpeaker:
                 self._speaking = False
 
     def _cue_watch(self):
-        """Fire beep + log when mute window transitions closed -> open."""
         while True:
             time.sleep(0.1)
             currently_muted = self.is_muted()
@@ -723,9 +538,6 @@ class TTSSpeaker:
                 threading.Thread(target=_play_speak_now_cue, daemon=True).start()
             self._prev_muted = currently_muted
 
-# =============================================================================
-#  COMMAND SENDER  (laptop -> Pi)
-# =============================================================================
 
 class CommandSender:
     def __init__(self):
@@ -763,28 +575,8 @@ class CommandSender:
         with self._lock:
             return self._sock is not None
 
-# =============================================================================
-#  VOICE LISTENER
-# =============================================================================
 
 class VoiceListener:
-    """
-    Always-listening loop:
-      1. Wait while TTS mute window is active
-      2. Wait while personality engine is running a behaviour
-      3. Acquire _MIC_LOCK, record WHISPER_CHUNK_SEC seconds
-      4. Discard if mute window reopened during recording
-      5. RMS gate -- skip silence
-      6. Transcribe with Whisper
-      7. Route to approval handler or LLM chat
-
-    FIX 2: chat response calls clear_queue() before say() so stale
-    queued speech cannot race with the new reply.
-
-    FIX 8: _processing_chat flag blocks the emotion loop from triggering
-    a new approval question while Ollama is generating a reply (TTS has
-    not started yet, so is_muted() is still False during that window).
-    """
 
     def __init__(self, ollama: OllamaResponder, tts: TTSSpeaker, personality):
         self._ollama           = ollama
@@ -792,7 +584,6 @@ class VoiceListener:
         self._personality      = personality
         self._running          = False
         self._sample_rate      = 16000
-        # FIX 8: True while we are waiting for Ollama to return a chat reply
         self._processing_chat  = False
 
     def start(self):
@@ -814,7 +605,6 @@ class VoiceListener:
         self._running = False
 
     def _record_chunk(self):
-        """Record one chunk, holding _MIC_LOCK for the full duration."""
         try:
             frames = int(WHISPER_CHUNK_SEC * self._sample_rate)
             with _MIC_LOCK:
@@ -850,28 +640,23 @@ class VoiceListener:
         time.sleep(3)
         while self._running:
             try:
-                # Gate 1: wait while TTS mute window is active
                 if self._tts.is_muted():
                     time.sleep(0.15)
                     continue
 
-                # Gate 2: wait while personality is running a behaviour
                 if self._personality._busy:
                     time.sleep(0.5)
                     continue
 
-                # Record
                 flat = self._record_chunk()
                 if flat is None:
                     time.sleep(0.5)
                     continue
 
-                # Discard if mute window opened during recording
                 if self._tts.is_muted():
                     print("[MIC] Discarded -- robot spoke during recording")
                     continue
 
-                # RMS silence gate
                 rms = float(np.sqrt(np.mean(flat ** 2))) * 1000
                 if not np.isfinite(rms):
                     rms = 0.0
@@ -879,7 +664,6 @@ class VoiceListener:
                 if rms < WHISPER_SILENCE_RMS:
                     continue
 
-                # Transcribe
                 print("[MIC] Speech detected -- transcribing ...")
                 text = self._transcribe(flat)
                 if not text or len(text.split()) < WHISPER_MIN_WORDS:
@@ -888,30 +672,18 @@ class VoiceListener:
 
                 print(f"[VOICE] Heard: \"{text}\"")
 
-                # Priority 1: yes/no approval gate
                 if self._personality.is_awaiting_approval():
                     consumed = self._personality.handle_approval(text)
                     if consumed:
                         continue
 
-                # Priority 2: normal chat
-                # FIX 2: clear stale queued speech before replying
-                # FIX 8: set _processing_chat so the emotion loop cannot
-                #         sneak in an approval question while Ollama thinks
                 if not self._tts.is_muted() and not self._personality._busy:
                     self._processing_chat = True
                     try:
                         self._tts.clear_queue()
                         reply = self._ollama.get_chat_response(text)
-                        # Extra safety: if approval arrived while we were
-                        # waiting for Ollama, discard the reply
                         if not self._personality.is_awaiting_approval():
-                            # FIX 10: chat replies use the long mute window so
-                            # the mic does not reopen mid-sentence on BT
                             self._tts.say(reply, mute_override=BT_LONG_MUTE_SECS)
-                            # FIX 11: reset cooldown so the emotion loop cannot
-                            # immediately fire a new approval question after
-                            # every chat reply
                             self._personality.reset_cooldown()
                         else:
                             print("[VOICE] Chat reply discarded -- approval pending")
@@ -920,12 +692,8 @@ class VoiceListener:
 
             except Exception as _e:
                 print(f"[VOICE] Loop error: {_e}")
-                self._processing_chat = False   # always clear on error
+                self._processing_chat = False  
                 time.sleep(1)
-
-# =============================================================================
-#  PERSONALITY ENGINE
-# =============================================================================
 
 _EMOTION_TO_MODE = {
     'happy':    'hype_bot',
@@ -947,10 +715,8 @@ _MODE_EXPRESSIONS = {
 }
 
 _YES_WORDS = {
-    # single words
     'yes', 'yeah', 'sure', 'okay', 'ok', 'yep', 'yup', 'please',
     'absolutely', 'definitely', 'certainly', 'indeed', 'affirmative',
-    # phrases (matched with 'in low' check in handle_approval)
     'go ahead', 'do it', 'tell me', 'of course', 'go on',
     'why not', 'go for it', 'sounds good', 'sounds great',
     'love to', 'would love', 'i would love', "i'd love",
@@ -982,17 +748,12 @@ class PersonalityEngine:
         self._awaiting       = False
         self._pending_mode   = None
         self._approval_t     = 0.0
-        # FIX 7: generation counter -- stale timeout threads check this
         self._approval_gen   = 0
-        # FIX 8: back-reference wired by PippoServer after construction
         self._voice_listener = None
 
-    # FIX 8: called by PippoServer.__init__() after VoiceListener is created
     def set_voice_listener(self, voice_listener):
         self._voice_listener = voice_listener
 
-    # FIX 11: called by VoiceListener after every chat reply so the emotion
-    # loop cannot immediately re-fire an approval question mid-conversation
     def reset_cooldown(self):
         with self._lock:
             self._cooldown_until = time.time() + COOLDOWN_AFTER
@@ -1001,13 +762,8 @@ class PersonalityEngine:
         with self._lock:
             if self._busy or self._awaiting:
                 return
-            # FIX 3: do not start a new approval question while the robot
-            # is still speaking or the mic mute window is open.
             if self._tts.is_muted():
                 return
-            # FIX 8: do not fire an approval question while VoiceListener
-            # is blocking inside get_chat_response() -- TTS is not muted
-            # yet, so is_muted() would pass, but we must still wait.
             if self._voice_listener and self._voice_listener._processing_chat:
                 return
             if time.time() < self._cooldown_until:
@@ -1034,18 +790,15 @@ class PersonalityEngine:
             if not self._awaiting:
                 return False
 
-            # FIX 1: strip punctuation before word matching so "Yes," == "yes"
             low   = re.sub(r'[^a-z0-9\s]', '', text.lower())
             words = set(low.split())
-
             approved = bool(words & _YES_WORDS) or any(p in low for p in _YES_WORDS if ' ' in p)
             denied   = bool(words & _NO_WORDS)  or any(p in low for p in _NO_WORDS  if ' ' in p)
-
             if approved:
                 mode = self._pending_mode
                 self._awaiting     = False
                 self._pending_mode = None
-                self._approval_gen += 1   # FIX 7: invalidate stale timeout
+                self._approval_gen += 1   
                 print(f"[APPROVAL] Approved -> launching {mode}")
                 threading.Thread(target=self._launch, args=(mode,), daemon=True).start()
                 return True
@@ -1053,18 +806,13 @@ class PersonalityEngine:
             if denied:
                 self._awaiting       = False
                 self._pending_mode   = None
-                self._approval_gen  += 1   # FIX 7: invalidate stale timeout
+                self._approval_gen  += 1   
                 self._cooldown_until = time.time() + COOLDOWN_AFTER
                 print("[APPROVAL] Denied -- going conversational")
                 starter = random.choice(_CHAT_STARTERS)
-                # FIX 2: clear stale queue before the denial follow-up
                 self._tts.clear_queue()
                 threading.Thread(target=self._tts.say, args=(starter,), daemon=True).start()
                 return True
-
-            # FIX 6: "Unclear" -- set cooldown so the emotion loop cannot
-            # immediately re-fire _ask_permission before the chat reply plays.
-            # FIX 7: also bump generation to invalidate the running timeout.
             self._awaiting       = False
             self._pending_mode   = None
             self._approval_gen  += 1
@@ -1081,35 +829,24 @@ class PersonalityEngine:
             return (self._mode == 'hand_follow') and not self._busy
 
     def _ask_permission(self, mode: str):
-        """
-        Must be called while holding self._lock.
-        FIX 2: clear_queue() before the permission question.
-        FIX 7: increment generation so any previous timeout thread exits.
-        """
         self._pending_mode  = mode
         self._awaiting      = True
         self._approval_t    = time.time()
-        self._approval_gen += 1          # invalidate any previous timeout
+        self._approval_gen += 1          
         gen = self._approval_gen
 
         question = _PERMISSION_Q.get(mode, "Can I say something?")
         print(f"[APPROVAL] Asking for {mode}: \"{question}\"")
-        # FIX 2: drain queue so nothing stale plays before the question
         self._tts.clear_queue()
-        self._tts.say(question)          # short utterance -> default 10 s mute
+        self._tts.say(question)          
         threading.Thread(
             target=self._approval_timeout, args=(gen,), daemon=True
         ).start()
 
     def _approval_timeout(self, gen: int):
-        """
-        FIX 7: exit silently if the generation has moved on (approval was
-        already resolved -- approved, denied, or unclear).
-        """
         time.sleep(APPROVAL_TIMEOUT)
         with self._lock:
             if not self._awaiting or self._approval_gen != gen:
-                # Stale timeout -- approval was already handled, do nothing
                 return
             print("[APPROVAL] Timed out -- going conversational")
             self._awaiting       = False
@@ -1117,7 +854,6 @@ class PersonalityEngine:
             self._approval_gen  += 1
             self._cooldown_until = time.time() + COOLDOWN_AFTER
         starter = random.choice(_CHAT_STARTERS)
-        # FIX 2: clear stale queue before timeout follow-up
         self._tts.clear_queue()
         self._tts.say(starter)
 
@@ -1154,8 +890,6 @@ class PersonalityEngine:
 
     def _fetch_and_speak(self, mode: str):
         text = self._ollama.get_response(mode)
-        # FIX 5: behavior responses use the long mute window (30 s) so the
-        # mic does not reopen before the joke / comfort / hype line finishes.
         self._tts.say(text, mute_override=BT_LONG_MUTE_SECS)
 
     def _motor_gesture(self, mode: str):
@@ -1177,10 +911,6 @@ class PersonalityEngine:
             self._cmd.send_motor(2200, -2200); time.sleep(0.35)
             self._cmd.send_motor(-2200, 2200); time.sleep(0.35)
         self._cmd.send_motor(0, 0)
-
-# =============================================================================
-#  VIDEO RECEIVER
-# =============================================================================
 
 class VideoReceiver:
     def __init__(self):
@@ -1238,9 +968,6 @@ class VideoReceiver:
                 return None
         return buf
 
-# =============================================================================
-#  CMD RECEIVER  (Pi -> laptop)
-# =============================================================================
 
 class CmdReceiver:
     def __init__(self, personality: PersonalityEngine):
@@ -1281,9 +1008,6 @@ class CmdReceiver:
         elif line:
             print(f"[CMD_RX] {line}")
 
-# =============================================================================
-#  MAIN SERVER
-# =============================================================================
 
 class PippoServer:
 
@@ -1299,8 +1023,6 @@ class PippoServer:
         self._use_emotion = use_emotion
         self._voice       = VoiceListener(self._ollama, self._tts, self._personality) if use_voice else None
 
-        # FIX 8: wire back-reference so PersonalityEngine can check
-        #         _processing_chat before firing approval questions
         if self._voice is not None:
             self._personality.set_voice_listener(self._voice)
 
@@ -1318,10 +1040,8 @@ class PippoServer:
         print(f"[CMD]   Listening on :{CMD_PORT}")
         print(f"[VIDEO] Listening on :{VIDEO_PORT}")
         print("\n[SERVER] Waiting for Pi -- start pippo_robot.py on the Pi now.\n")
-
         threading.Thread(target=self._accept_cmd,   daemon=True).start()
         threading.Thread(target=self._accept_video, daemon=True).start()
-
         self._ready.wait()
         print("\n[SERVER] Pi connected -- Pippo-bot is LIVE!")
         print(f"[SERVER] Audio output : {AUDIO_OUTPUT.upper()}")
@@ -1426,7 +1146,6 @@ class PippoServer:
             h, w  = frame.shape[:2]
             muted = self._tts.is_muted()
 
-            # Flash green banner when mute window just closed
             if prev_muted and not muted:
                 cue_flash_until = time.time() + 2.5
             prev_muted = muted
@@ -1479,9 +1198,6 @@ class PippoServer:
 
         self.stop()
 
-# =============================================================================
-#  ENTRY POINT
-# =============================================================================
 
 def main():
     global AUDIO_OUTPUT, BT_FIXED_MUTE_SECS, BT_LONG_MUTE_SECS
